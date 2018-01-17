@@ -1,10 +1,9 @@
-#define BLYNK_PRINT Serial
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
 #include <BlynkSimpleEsp8266.h>
 #include <SimpleTimer.h>
 #include <Time.h>
@@ -21,10 +20,13 @@ char vypni[] = "111010001010100000";      //radio signal to turn the heating off
 char Date[16];
 char Time[16];
 
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
+
 long startseconds;
 long stopseconds;
 long nowseconds;
-
+float measurement;
 float celsius = 25;
 int poslsignal = 2;
 int timer1 = 0;               //weekend
@@ -33,7 +35,7 @@ int timer3 = 0;               //weekday evening
 int ciltepl;
 int zaptepl;
 int vyptepl;
-int pouztepl;
+int norefresh;
 SimpleTimer timer;
 WidgetRTC rtc;
 WidgetTerminal terminal(V10);
@@ -41,12 +43,12 @@ OneWire oneWire(D2);
 DallasTemperature sensors(&oneWire);
 
 RCSwitch mySwitch = RCSwitch();
-
-
+ 
 void reconnectBlynk() {
   sensors.requestTemperatures();
-  if (sensors.getTempCByIndex(0) > 1 && sensors.getTempCByIndex(0) < 50) {
-    celsius = sensors.getTempCByIndex(0);
+  measurement = sensors.getTempCByIndex(0);
+  if (measurement > 1 && measurement < 50) {
+    celsius = measurement;      
   }
   Blynk.virtualWrite(V7, celsius); //V7 = current temperature
   Blynk.virtualWrite(V17, ciltepl); //V17 = target temperature
@@ -54,12 +56,13 @@ void reconnectBlynk() {
     digitalWrite(D5, LOW);
     digitalWrite(D4, HIGH);
     if (Blynk.connect()) {
-      BLYNK_LOG("Reconnected");
+    terminal.print("Blynk reconnected at ");
+    terminal.print(Time);
+    terminal.print(" on ");
+    terminal.println(Date);
+    terminal.flush();  
     }
     else {
-      BLYNK_LOG("Not reconnected");
-      zaptepl = 18;     //NOVE
-      vyptepl = 18;     //NOVE
       digitalWrite(D5, HIGH);
       digitalWrite(D4, LOW);
     }
@@ -68,7 +71,7 @@ void reconnectBlynk() {
 }
 
 void refreshsignal() {
-  if (poslsignal == 0) {
+  if (poslsignal == 0 && norefresh == 0) {
     digitalWrite(D4, HIGH);
     mySwitch.send(vypni);
     Blynk.virtualWrite(V4, 0);
@@ -93,27 +96,27 @@ void setup() {
   mySwitch.setProtocol(5);    //protocol 5 in the rcswitch.cpp
   Blynk.begin(auth, ssid, pass);
   while (Blynk.connect() == false) {    // Wait until connected
-    if (millis() > 300000) {    //unless Blynk connects within 5 minutes, keep temp at 18 degrees
-      vyptepl = 18;   
-      zaptepl = 18;   
-      break;
+    if (millis() > 300000) {    //keep trying to connect to server for 5 minutes
+    break;
     }
   }
-  ArduinoOTA.begin();
   rtc.begin();
-  sensors.begin();          //DS18B20, resolution 11 = accuracy of 0.125C
-  sensors.setResolution(11);
+  httpUpdater.setup(&httpServer);
+  httpServer.begin();   
+  sensors.begin();          
+  sensors.setResolution(11);        //DS18B20, resolution 11 = accuracy of 0.125C
   sensors.requestTemperatures();
-  if (sensors.getTempCByIndex(0) > 1 && sensors.getTempCByIndex(0) < 50) { //ignore temperatures way off the expected values
-    celsius = sensors.getTempCByIndex(0);
-  }
+  measurement = sensors.getTempCByIndex(0);  
+  if (measurement > 1 && measurement < 50) {  // ignore incorrect temperature measurements
+    celsius = measurement;
+  }    
   if (Blynk.connected()) {
     digitalWrite(D4, HIGH);   //turn LEDs off if Blynk connects
     digitalWrite(D5, LOW);
   }
   timer.setInterval(61000L, activetoday);     // check every minute if schedule should run today
-  timer.setInterval(29000L, reconnectBlynk);  // check every 30s if still connected to server, also get temperature
-  timer.setInterval(123000L, refreshsignal);  // refresh last transmitted signal every 2 minutes (the numbers are slightly altered to reduce the number of collisions)
+  timer.setInterval(29000L, reconnectBlynk);  // check every 30s if still connected to server
+  timer.setInterval(369000L, refreshsignal);  // refresh last transmitted signal every 6 minutes (the numbers are slightly altered to reduce the number of collisions)
 }
 
 void activetoday() {  // check if schedule should run today
@@ -126,8 +129,11 @@ void activetoday() {  // check if schedule should run today
     // Blynk.syncVirtual(V3); // sync timeinput widget - weekday evening
   }
   else {
-    digitalWrite(D4, LOW);
-    digitalWrite(D5, HIGH);
+      terminal.print("Invalid time ");
+      terminal.print(Time);
+      terminal.print(" and date ");
+      terminal.println(Date);
+      terminal.flush();      
   }
 }
 
@@ -211,6 +217,31 @@ BLYNK_WRITE(V3) {  //test for weekday evening, if so set timer3 to 1
   }
 }
 
+BLYNK_WRITE(V12) {
+  if(param.asInt()==1){
+    norefresh = 1;     
+  }
+  else{
+    norefresh = 0;    
+  } 
+}
+
+BLYNK_WRITE(V11) {
+  if(param.asInt()==1){
+    mySwitch.send(zapni);
+    Blynk.virtualWrite(V4, 255); 
+    poslsignal = 1;
+    terminal.print("Heating turned on manually at ");
+    terminal.print(Time);
+    terminal.print(" on ");
+    terminal.print(Date);
+    terminal.print(", temperature ");
+    terminal.println(celsius);
+    terminal.flush();       
+    digitalWrite(D5, HIGH);
+    Blynk.virtualWrite(V11, 0);    
+    }
+} 
 
 void loop() {
 
@@ -220,8 +251,9 @@ void loop() {
   else {
     ciltepl = vyptepl;  //inactive time temperature, so that it doesn't get too cold
   }
-
-  if (celsius <= (ciltepl - 0.5) && poslsignal != 1) {
+  
+  if (Blynk.connected()) {
+   if (celsius <= (ciltepl - 0.5) && poslsignal != 1) {
     mySwitch.send(zapni);
     poslsignal = 1;
     Blynk.virtualWrite(V4, 255);         //turn on virtual LED
@@ -244,11 +276,20 @@ void loop() {
     Blynk.virtualWrite(V4, 0);
     digitalWrite(D4, LOW);            // turn on built-in blue LED, turn off red LED
     digitalWrite(D5, LOW);
+    }
+  }
+  else if(poslsignal == 0 && celsius >= 1 && celsius <= 18){
+    mySwitch.send(zapni);
+    poslsignal = 1;
+  }
+  else if(poslsignal == 1 && celsius >= 21){
+    mySwitch.send(vypni);
+    poslsignal = 0;      
   }
 
   if (Blynk.connected()) {
     Blynk.run();
-    ArduinoOTA.handle();
+    httpServer.handleClient(); 
 
   }
 
